@@ -1,0 +1,356 @@
+##
+# A simple bridge between MQTT and an LG 43MU79 monitor. Powered by ESPHome and intended for use with HomeAssistant.
+#
+# The 43MU79 has a RS232 version C port which allows for reasonably easy control. Basically, a few bytes sent to a UART
+#   is enough to turn the screen on/off and select the input source. There is additional functionality exposed via the port,
+#   but selecting input and power on/off is all that my needs require.
+#
+# However, the `serial_details.md` document has all the documented payloads that the monitor supports.
+#
+# Because HA does not *yet* support a generic "media_display" component, esphome does not implement one.
+# The next best implementation is to have ESPHome listen for specific MQTT topics and when a message is recieved and then
+# send the proper UART sequence.
+#
+# So this means that in both ESPHome and Home Assistant config, there's several individual components that more or less focus on
+#   sending commands via MQTT or reading state from MQTT. Not ideal, but once implemented, you don't really see the "mess".
+#
+# See: https://community.home-assistant.io/t/uart-switch-help/123245
+##
+# Karl Quinsland, 2019.
+# Free to use for any non-commercial purposes.
+# Commercial use requires express written consent from me.
+##
+# Substitutions make it easier to read the yaml
+# See: https://esphome.io/guides/configuration-types.html#substitutions
+##
+substitutions:
+  # WIFI
+  wifi_name: !secret wifi_ssid
+  wifi_pass: !secret wifi_pass
+
+  # MQTT
+  mqtt_host: !secret mqtt_host
+  mqtt_user: !secret mqtt_user
+  mqtt_pass: !secret mqtt_pass
+
+  # OTA/Updates
+  ota_pass: !secret ota_pass
+
+  ##
+  # MQTT stuff for controlling the monitor
+  # The topic that we will accept input request from
+  mqtt_topic_cmd: esphome/rs232/lg/input
+  # Topic we report stat TO
+  mqtt_topic_state: esphome/rs232/lg
+
+  # Displayed in HA frontend
+  friendly_name: "Workstation Monitor Controller"
+  friendly_name_short: Monitor
+
+esphome:
+  name: monitor_bridge
+  platform: ESP32
+  # WeMos does not make a esp32 module in the d1 MINI form factor but that's
+  # what i have. It's a d1 mini pin compatable kit from china. ~$6/board makes it
+  # a wonderfuly cheap/powerful board for most ESPHome devices
+  #
+  # See: https://www.aliexpress.com/item/MH-ET-LIVE-ESP32-MINI-KIT-WiFi-Bluetooth-Internet-of-Things-development-board-based-ESP8266-Fully/32819107932.html
+  ##
+  # See: https://docs.platformio.org/en/latest/boards/espressif32/esp32doit-devkit-v1.html
+  board: mhetesp32minikit
+  # Components required for integration into the ESPHome framework
+  # See: https://esphome.io/custom/custom_component.html
+
+# See: https://esphome.io/components/wifi.html
+wifi:
+  ssid: ${wifi_name}
+  password: ${wifi_pass}
+
+# See: https://esphome.io/components/mqtt.html
+mqtt:
+  broker: ${mqtt_host}
+  username: ${mqtt_user}
+  password: ${mqtt_pass}
+
+# Enable logging
+logger:
+
+ota:
+  # See: https://esphome.io/components/ota.html
+  password: ${ota_pass}
+
+# Enable status LED; very low resolution logging :)
+# See: https://esphome.io/components/status_led.html
+status_led:
+  # Wemos uses GPIO2 for the built in LED
+  pin:
+    number: GPIO2
+    # It needs an inversion (active low)
+    inverted: True
+
+# We need to configure/setup the UART
+# See: https://esphome.io/components/uart.html
+uart:
+  # There are three hardware UARTS on the ESP32. The first will be left for firmware/debugging. We'll use UART2
+  #   on pins 16 (espRX) and 17 (espTX)
+  tx_pin: GPIO16
+  rx_pin: GPIO17
+  # LG monitor wants 9600/8N1... pretty standard :)
+  baud_rate: 9600
+
+binary_sensor:
+  # A "connected?" status sensor that - as long as sensor + mqtt + HA are working -
+  #   will always display "true". Allows for easy detection of sensor failure from HA
+  # See: https://esphome.io/components/binary_sensor/status.html
+  - platform: status
+    name: "${friendly_name} Status"
+
+# We want to give the user the ability to control the input that the display is currently using.
+# We do this by subscribing to a topic. The idea is that we watch a topic for changes. ESPHome will attempt to parse
+#   whatever value is present into a floating point number. It emits a WARNING to the logs if the parse fails.
+#
+# Assumig the parse worked, the `on_raw_value` lambda is called. It runs through a switch statement to determine
+#   which of the inputs should be selected. Each input is exposed as a "switch" and has automations attached so that
+#   only one switch can be "on" at any given time.
+#
+# The numbers map to ports with port 0 being the left most port when staring at the BACK of the monitor
+#   e.g. the left most port is HDMI_1, so a value of 1 will activate HDMI_1 and a value of 2 will activate HDMI_2
+#     and the 6th port from the left is the USBC port, so a value of 6 triggers that...
+##
+sensor:
+  # A measurement that is useful for detecting wifi reception problems
+  # Make sure to set HA to retain this data for a very short time!
+  #
+  # See: https://community.home-assistant.io/t/iron-gate-sensor/97656/6
+  - platform: wifi_signal
+    name: "${friendly_name} Wifi Signal"
+    update_interval: 5s
+    filters:
+      - sliding_window_moving_average:
+          # hold 15 measurements, taken every 5 seconds
+          window_size: 15
+          # every 15 seconds, send the updated result..
+          send_every: 15
+
+  - platform: mqtt_subscribe
+    name: "${friendly_name} Input"
+    id: monititor_input_select
+    topic: ${mqtt_topic_cmd}
+    # And when a value comes in, pass to a lambda to decode and make the UART call
+    on_raw_value:
+      - lambda: |-
+          // cast to INT
+          int desired_input= (int)x;
+
+          // Begin trying to decode the desitred selected input
+          switch(desired_input) {
+            case 1:
+              ESP_LOGD("INPUT_SEL", "Value %d is %s", desired_input, "HDMI_1");
+              id(input_hdmi_1).turn_on();
+              break;
+            case 2:
+              ESP_LOGD("INPUT_SEL", "Value %d is %s", desired_input, "HDMI_2");
+              id(input_hdmi_2).turn_on();
+              break;
+            case 3:
+              ESP_LOGD("INPUT_SEL", "Value %d is %s", desired_input, "HDMI_3");
+              id(input_hdmi_3).turn_on();
+              break;
+            case 4:
+              ESP_LOGD("INPUT_SEL", "Value %d is %s", desired_input, "HDMI_4");
+              id(input_hdmi_4).turn_on();
+              break;
+            case 5:
+              ESP_LOGD("INPUT_SEL", "Value %d is %s", desired_input, "DISPLAY_PORT_1");
+              id(inpt_dp_1).turn_on();
+              break;
+            case 6:
+              ESP_LOGD("INPUT_SEL", "Value %d is %s", desired_input, "USB_C_1");
+              id(inpt_usbc_1).turn_on();
+              break;
+            default:
+              // OH NO! We got a value we don't support;
+              ESP_LOGE("INPUT_SEL", "In default case! Can't parse determined_input from %f", x);
+          }
+
+##
+# And now the "meat" of the config... the various switches to expose to HA and the bytes to send over the UART for each switch
+#
+# To keep the HA config "simple" we only expose a few "public" devices to HA and keep the rest of the switches INTERNAL
+#   to esp home
+##
+switch:
+  #####
+  # PUBLIC SWITCHES
+  #####
+  ## POWER
+  - platform: template
+    name: "${friendly_name_short} Power"
+    id: monitor_power
+    # We deinfe a lambda that determines the state of the template sensor
+    # it LOOKS like just a simple return {} works if the last state should be "kept"
+    turn_on_action:
+      then:
+        # Set our own internal state, so the HA UI will reflect the correct state
+        - switch.template.publish:
+            id: monitor_power
+            state: ON
+        - uart.write: [0x6B, 0x61, 0x20, 0x30, 0x31, 0x20, 0x30, 0x31, 0x0D]
+        - mqtt.publish:
+            topic: ${mqtt_topic_state}
+            payload: "ON"
+    turn_off_action:
+      then:
+        # Set our own internal state, so the HA UI will reflect the correct state
+        - switch.template.publish:
+            id: monitor_power
+            state: OFF
+        - uart.write: [0x6B, 0x61, 0x20, 0x30, 0x31, 0x20, 0x30, 0x30, 0x0D]
+        - mqtt.publish:
+            topic: ${mqtt_topic_state}
+            payload: "OFF"
+  ## SOUND
+  - platform: template
+    name: "${friendly_name_short} Mute"
+    id: monitor_mute
+    turn_on_action:
+      then:
+        # Set our own internal state, so the HA UI will reflect the correct state
+        - switch.template.publish:
+            id: monitor_mute
+            state: ON
+        # Turn mute ON to get no sound
+        - uart.write: [0x6B, 0x65, 0x20, 0x30, 0x31, 0x20, 0x30, 0x30, 0x0D]
+        - mqtt.publish:
+            topic: ${mqtt_topic_state}
+            payload: "MUTED"
+    turn_off_action:
+      then:
+        # Set our own internal state, so the HA UI will reflect the correct state
+        - switch.template.publish:
+            id: monitor_mute
+            state: OFF
+        - uart.write: [0x6B, 0x65, 0x20, 0x30, 0x31, 0x20, 0x30, 0x31, 0x0D]
+        - mqtt.publish:
+            topic: ${mqtt_topic_state}
+            payload: "UNMUTED"
+
+  #####
+  # INTERNAL SWITCHES
+  # Theses are "internal state machine" switches that are NOT exposed to MQTT/HA
+  #####
+  ## INPUT SELECT
+  - platform: uart
+    id: input_hdmi_1
+    internal: true
+    # Toggles the input to HDMI1. C1: x C2: b
+    ##
+    #       x     b     [ ]   0     1     [ ]    9     0    EOP
+    data: [0x78, 0x62, 0x20, 0x30, 0x31, 0x20, 0x39, 0x30, 0x0D]
+    on_turn_on:
+      then:
+        - mqtt.publish:
+            topic: ${mqtt_topic_state}
+            payload: "HDMI_1"
+        # Turn off al the other switches
+        - switch.turn_off: input_hdmi_2
+        - switch.turn_off: input_hdmi_3
+        - switch.turn_off: input_hdmi_4
+        - switch.turn_off: inpt_dp_1
+        - switch.turn_off: inpt_usbc_1
+
+  - platform: uart
+    id: input_hdmi_2
+    internal: true
+    # Toggles the input. C1: x C2: b
+    ##
+    #       x     b     [ ]   0     1     [ ]    9     1    EOP
+    data: [0x78, 0x62, 0x20, 0x30, 0x31, 0x20, 0x39, 0x31, 0x0D]
+    on_turn_on:
+      then:
+        - mqtt.publish:
+            topic: ${mqtt_topic_state}
+            payload: "HDMI_2"
+        # Turn off al the other switches
+        - switch.turn_off: input_hdmi_1
+        - switch.turn_off: input_hdmi_3
+        - switch.turn_off: input_hdmi_4
+        - switch.turn_off: inpt_dp_1
+        - switch.turn_off: inpt_usbc_1
+
+  - platform: uart
+    id: input_hdmi_3
+    internal: true
+    # Toggles the input. C1: x C2: b
+    ##
+    #       x     b     [ ]   0     1     [ ]    9     2    EOP
+    data: [0x78, 0x62, 0x20, 0x30, 0x31, 0x20, 0x39, 0x32, 0x0D]
+    on_turn_on:
+      then:
+        - mqtt.publish:
+            topic: ${mqtt_topic_state}
+            payload: "HDMI_3"
+        # Turn off al the other switches
+        - switch.turn_off: input_hdmi_1
+        - switch.turn_off: input_hdmi_2
+        - switch.turn_off: input_hdmi_4
+        - switch.turn_off: inpt_dp_1
+        - switch.turn_off: inpt_usbc_1
+
+  - platform: uart
+    id: input_hdmi_4
+    internal: true
+    # Toggles the input. C1: x C2: b
+    ##
+    #       x     b     [ ]   0     1     [ ]    9     3    EOP
+    data: [0x78, 0x62, 0x20, 0x30, 0x31, 0x20, 0x39, 0x33, 0x0D]
+    on_turn_on:
+      then:
+        - mqtt.publish:
+            topic: ${mqtt_topic_state}
+            payload: "HDMI_4"
+        # Turn off al the other switches
+        - switch.turn_off: input_hdmi_1
+        - switch.turn_off: input_hdmi_2
+        - switch.turn_off: input_hdmi_3
+        - switch.turn_off: inpt_dp_1
+        - switch.turn_off: inpt_usbc_1
+
+  - platform: uart
+    id: inpt_dp_1
+    internal: true
+    # Toggles the input. C1: x C2: b
+    ##
+    #       x     b     [ ]   0     1     [ ]    c     0    EOP
+    data: [0x78, 0x62, 0x20, 0x30, 0x31, 0x20, 0x63, 0x30, 0x0D]
+    on_turn_on:
+      then:
+        - mqtt.publish:
+            topic: ${mqtt_topic_state}
+            payload: "DP_1"
+        # Turn off al the other switches
+        - switch.turn_off: input_hdmi_1
+        - switch.turn_off: input_hdmi_2
+        - switch.turn_off: input_hdmi_3
+        - switch.turn_off: input_hdmi_4
+        - switch.turn_off: inpt_usbc_1
+
+  - platform: uart
+    id: inpt_usbc_1
+    # Toggles the input. C1: x C2: b
+    ##
+    # NOTE: the CASE of the "data" does not matter. E.G.: to switch to USB0, send EITHER e0 OR E0.
+    #   but to keep things simple, i've kept the bytes lower case (i use 0x65 for little e versus 0x45 for BIG E)
+    #       x     b     [ ]   0     1     [ ]    e     0    EOP
+    data: [0x78, 0x62, 0x20, 0x30, 0x31, 0x20, 0x65, 0x30, 0x0D]
+    on_turn_on:
+      then:
+        - mqtt.publish:
+            topic: ${mqtt_topic_state}
+            payload: "USBC_1"
+        # Turn off al the other switches
+        - switch.turn_off: input_hdmi_1
+        - switch.turn_off: input_hdmi_2
+        - switch.turn_off: input_hdmi_3
+        - switch.turn_off: input_hdmi_4
+        - switch.turn_off: inpt_dp_1

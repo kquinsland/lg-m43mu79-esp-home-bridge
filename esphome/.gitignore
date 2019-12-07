@@ -1,0 +1,4 @@
+##
+# esphome and venv artifacts
+venv/*
+monitor_bridge/*
